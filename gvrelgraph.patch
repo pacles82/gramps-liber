@@ -1,0 +1,472 @@
+--- /home/utente/grampsweb/gvrelgraph_ORIGINAL.py	2026-08-21 12:00:13.231727268 +0200
++++ /home/utente/grampsweb/gvrelgraph.py	2026-09-01 22:46:51.981304082 +0200
+@@ -40,6 +40,10 @@
+ # ------------------------------------------------------------------------
+ from functools import partial
+ import html
++import json
++import os
++import re
++import tempfile
+ 
+ # ------------------------------------------------------------------------
+ #
+@@ -53,6 +57,7 @@
+     BooleanOption,
+     EnumeratedListOption,
+     FilterOption,
++    NumberOption,
+     PersonOption,
+     ColorOption,
+ )
+@@ -155,6 +160,9 @@
+         self.includeurl = get_value("url")
+         self.includeimg = get_value("includeImages")
+         self.imgpos = get_value("imageOnTheSide")
++        self.include_coatsofarms = get_value("includeCoatsOfArms")
++        self.coa_width = get_value("coaWidth")
++        self._coa_cache = {}
+         self.use_roundedcorners = get_value("useroundedcorners")
+         self.use_hexagons = get_value("usehexagons")
+         self.adoptionsdashed = get_value("dashed")
+@@ -375,7 +383,7 @@
+             if self._user:
+                 self._user.step_progress()
+             # determine per person if we use HTML style label
+-            if self.includeimg:
++            if self.includeimg or self.include_coatsofarms:
+                 self.use_html_output = True
+             person = self._db.get_person_from_handle(person_handle)
+             if person is None:
+@@ -450,6 +458,8 @@
+         if fam is None:
+             return
+         fam_id = fam.get_gramps_id()
++        # reset per-family coat-of-arms accumulator (was leaking from previous person/family)
++        self._coa_rows = []
+ 
+         m_type = m_date = m_place = ""
+         d_type = d_date = d_place = ""
+@@ -489,7 +499,7 @@
+                     labellines.append(line)
+                     line = ""
+                 if m_place:
+-                    line += " %s" % m_place
++                    line += " %s" % self.get_place_with_coa(m_place)
+                 labellines.append(line)
+             if d_type:
+                 line = d_type.get_abbreviation()
+@@ -505,7 +515,7 @@
+             if m_date:
+                 labellines.append("(%s)" % m_date)
+             if m_place:
+-                labellines.append("(%s)" % m_place)
++                labellines.append("(%s)" % self.get_place_with_coa(m_place))
+ 
+         label = "\\n".join(labellines)
+         labellines = list()
+@@ -515,6 +525,19 @@
+         if len(label):
+             labellines.append(label)
+         label = " ".join(labellines)
++        # If coats of arms are collected, render family as HTML table with box shape
++        if self.include_coatsofarms and getattr(self, "_coa_rows", None):
++            # Ensure label has visible text; if empty, add placeholder
++            display_label = label if label.strip() else "Famiglia"
++            html_label = '<TABLE BORDER="0" CELLSPACING="2" CELLPADDING="0" CELLBORDER="0"><TR><TD>%s</TD></TR>' % display_label.replace("\\n", "<BR/>").replace("\n", "<BR/>")
++            html_label += "<TR>"
++            for _path, _place in self._coa_rows:
++                html_label += '<TD><IMG SRC="%s"/></TD>' % _path
++            html_label += "</TR></TABLE>"
++            label = html_label
++            shape = "box"
++        else:
++            shape = "ellipse"
+ 
+         color = ""
+         fill = ""
+@@ -524,7 +547,7 @@
+         elif self.colorize == "filled":
+             fill = self.colors["family"]
+             style = "filled"
+-        self.doc.add_node(fam_id, label, "ellipse", color, style, fill)
++        self.doc.add_node(fam_id, label, shape, color, style, fill)
+ 
+         # If subgraphs are used then we add both spouses here and Graphviz
+         # will attempt to position both spouses closely together.
+@@ -623,6 +646,70 @@
+                 fill = self.colors["unknown"]
+         return (shape, style, color, fill)
+ 
++    def _resolve_media_path(self, media):
++        """Resolve the on-disk path of a media object.
++
++        Grampsweb stores media under GRAMPSWEB_MEDIA_BASE_DIR, optionally
++        prefixed by the tree id. The Gramps DB media path is not set, so
++        media_path_full() would fall back to the wrong location.
++        """
++        fname = media.get_path()
++        try:
++            if media.get_mime_type()[0:5] == "image":
++                pass
++        except Exception:
++            pass
++        base_dir = os.environ.get("GRAMPSWEB_MEDIA_BASE_DIR", "")
++        prefix_tree = os.environ.get("GRAMPSWEB_MEDIA_PREFIX_TREE", "") == "true"
++        if base_dir:
++            # tree id = basename of the Gramps DB directory
++            tree = ""
++            try:
++                tree = os.path.basename(self._db.get_save_path() or "")
++            except Exception:
++                tree = ""
++            if prefix_tree and tree:
++                full = os.path.join(base_dir, tree, fname)
++            else:
++                full = os.path.join(base_dir, fname)
++            if os.path.isfile(full):
++                return full
++        # fall back to the standard resolution
++        return media_path_full(self._db, fname)
++
++    def _get_person_photo(self, media):
++        """Return a small PNG thumbnail of a person photo, or None.
++
++        Grampsweb keeps media under /app/media/<tree>/ and generates its own
++        thumbnails; the Gramps desktop thumbnail cache used by
++        get_thumbnail_path/find_file is not available inside the containers,
++        so we render a small thumbnail with Pillow ourselves.
++        """
++        src = self._resolve_media_path(media)
++        if not src or not os.path.isfile(src):
++            return None
++        try:
++            from PIL import Image
++
++            thumb_dir = os.path.join(tempfile.gettempdir(), "personphotos")
++            os.makedirs(thumb_dir, exist_ok=True)
++            h = os.path.basename(src)
++            if h.startswith(("thumb/", "normal/")):
++                h = os.path.basename(h)
++            target = os.path.join(thumb_dir, "%s.jpg" % re.sub(r"\W+", "_", h))
++            if os.path.isfile(target):
++                return target
++            with Image.open(src) as im:
++                im = im.convert("RGB")
++                width = 60
++                ratio = width / float(im.size[0])
++                height = max(1, int(round(im.size[1] * ratio)))
++                im = im.resize((width, height), Image.LANCZOS)
++                im.save(target, "JPEG", quality=85)
++            return target
++        except Exception:
++            return None
++
+     def get_person_label(self, person):
+         "return person label string"
+         # see if we have an image to use for this person
+@@ -634,16 +721,11 @@
+                 media = self._db.get_media_from_handle(media_handle)
+                 media_mime_type = media.get_mime_type()
+                 if media_mime_type[0:5] == "image":
+-                    image_path = get_thumbnail_path(
+-                        media_path_full(self._db, media.get_path()),
+-                        rectangle=media_list[0].get_rectangle(),
+-                    )
+-                    # test if thumbnail actually exists in thumbs
+-                    # (import of data means media files might not be present
+-                    image_path = find_file(image_path)
++                    image_path = self._get_person_photo(media)
+ 
+         label = ""
+         line_delimiter = "\\n"
++        self._coa_rows = []
+ 
+         # If we have an image, then start an HTML table; remember to close
+         # the table afterwards!
+@@ -656,16 +738,19 @@
+         #
+         #       http://www.graphviz.org/info/shapes.html#html
+         #
+-        if self.use_html_output and image_path:
++        if self.use_html_output and (image_path or self.include_coatsofarms):
+             line_delimiter = "<BR/>"
+             label += '<TABLE BORDER="0" CELLSPACING="2" CELLPADDING="0" '
+-            label += 'CELLBORDER="0"><TR><TD></TD><TD>'
+-            label += '<IMG SRC="%s"/></TD><TD></TD>' % image_path
+-            if self.imgpos == 0:
+-                # trick it into not stretching the image
+-                label += '</TR><TR><TD COLSPAN="3">'
++            if image_path:
++                label += 'CELLBORDER="0"><TR><TD></TD><TD>'
++                label += '<IMG SRC="%s"/></TD><TD></TD>' % image_path
++                if self.imgpos == 0:
++                    # trick it into not stretching the image
++                    label += '</TR><TR><TD COLSPAN="3">'
++                else:
++                    label += "<TD>"
+             else:
+-                label += "<TD>"
++                label += 'CELLBORDER="0"><TR><TD COLSPAN="3">'
+         else:
+             # no need for html label with this person
+             self.use_html_output = False
+@@ -697,25 +782,42 @@
+             ):
+                 label += "%s(" % line_delimiter
+                 if b_place:
+-                    label += "%s" % b_place
++                    label += "%s" % self.get_place_with_coa(b_place)
+                 label += " – "
+                 if d_place:
+-                    label += "%s" % d_place
++                    label += "%s" % self.get_place_with_coa(d_place)
+                 label += ")"
++            # Residence with coat of arms
++            if self.include_coatsofarms and self.event_choice in [2, 3, 5, 6]:
++                for event_ref in person.get_event_ref_list():
++                    event = self._db.get_event_from_handle(event_ref.ref)
++                    if event and event.type == EventType.RESIDENCE:
++                        place = self.get_place_string(event)
++                        if place:
++                            label += "%sRes.: %s" % (line_delimiter, self.get_place_with_coa(place))
++                            break
+         if self.event_choice == 7:
+             if b_type:
+                 label += "%s%s" % (line_delimiter, b_type.get_abbreviation())
+                 if b_date:
+                     label += " %s" % b_date
+                 if b_place:
+-                    label += " %s" % b_place
++                    label += " %s" % self.get_place_with_coa(b_place)
+ 
+             if d_type:
+                 label += "%s%s" % (line_delimiter, d_type.get_abbreviation())
+                 if d_date:
+                     label += " %s" % d_date
+                 if d_place:
+-                    label += " %s" % d_place
++                    label += " %s" % self.get_place_with_coa(d_place)
++            if self.include_coatsofarms:
++                for event_ref in person.get_event_ref_list():
++                    event = self._db.get_event_from_handle(event_ref.ref)
++                    if event and event.type == EventType.RESIDENCE:
++                        place = self.get_place_string(event)
++                        if place:
++                            label += "%sRes.: %s" % (line_delimiter, self.get_place_with_coa(place))
++                            break
+ 
+         if self.increlname and self.center_person != person:
+             # display relationship info
+@@ -778,7 +880,14 @@
+ 
+         # see if we have a table that needs to be terminated
+         if self.use_html_output:
+-            label += "</TD></TR></TABLE>"
++            label += "</TD></TR>"
++            if self._coa_rows:
++                label += "<TR>"
++                for _path, _place in self._coa_rows:
++                    # _place è già html-escape-ato; evita doppia escape (Torre d&#x27;Isola -> Torre d&amp;#x27;Isola)
++                    label += '<TD><IMG SRC="%s" TITLE="%s"/></TD>' % (_path, html.escape(html.unescape(_place)))
++                label += "</TR>"
++            label += "</TABLE>"
+             return label
+         else:
+             # non html label is enclosed by "" so escape other "
+@@ -844,6 +953,171 @@
+             return html.escape(place)
+         return ""
+ 
++    def get_place_with_coa(self, place):
++        """
++        Return the place string with an <IMG> of the city coat of arms
++        prepended, if the coat of arms could be retrieved.
++        """
++        if not place or not self.include_coatsofarms:
++            return place
++        # place è già html.escape()-ato (es. "Torre d&#x27;Isola"); de-escaparlo prima di ricavare la città
++        city = html.unescape(place).split(",")[0].strip()
++        path = self._get_coa_path(city)
++        if not path:
++            return place
++        self._coa_rows.append((path, place))
++        return place
++
++    def _get_coa_path(self, city):
++        """Return the local path of the coat of arms image for a city, or None."""
++        if not city:
++            return None
++        key = city.lower()
++        if key in self._coa_cache:
++            return self._coa_cache[key]
++        # check the on-disk cache first so a temporary network failure
++        # does not discard an already downloaded image
++        coa_dir = os.path.join(tempfile.gettempdir(), "coatofarms")
++        safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", city).strip("_")[:50] or "city"
++        existing = None
++        # a persistent override directory, bind-mounted from the host, wins over
++        # anything else and over the online lookup
++        for dirname in (
++            "/venv/share/coatofarms",
++            coa_dir,
++        ):
++            if not os.path.isdir(dirname):
++                continue
++            for ext in (".png", ".svg", ".jpg", ".jpeg"):
++                cand = os.path.join(dirname, "%s%s" % (safe, ext))
++                if os.path.isfile(cand):
++                    existing = cand
++                    break
++            if existing:
++                break
++        if existing:
++            resized = self._resize_coa(existing)
++            self._coa_cache[key] = resized or existing
++            return self._coa_cache[key]
++        path = self._fetch_coa(city)
++        if path:
++            path = self._resize_coa(path) or path
++        self._coa_cache[key] = path
++        return path
++
++    def _resize_coa(self, path):
++        """Return a version of the coat of arms resized to coa_width points, or None."""
++        try:
++            from PIL import Image
++
++            width = getattr(self, "coa_width", 30)
++            if width <= 0 or width >= 120:
++                return None
++            base, ext = os.path.splitext(path)
++            resized = "%s_w%d.png" % (base, width)
++            if os.path.isfile(resized):
++                return resized
++            with Image.open(path) as im:
++                im = im.convert("RGBA")
++                ratio = width / float(im.size[0])
++                height = max(1, int(round(im.size[1] * ratio)))
++                im = im.resize((width, height), Image.LANCZOS)
++                im.save(resized, "PNG")
++            return resized
++        except Exception:
++            return None
++
++    def _fetch_coa(self, city):
++        """Fetch the coat of arms image from Wikimedia and cache it locally."""
++        import requests
++
++        hdr = {"User-Agent": "GrampsWeb-RelGraph/1.0 (grampsweb report)"}
++        try:
++            # 1. find the Wikidata entity for the city
++            r = requests.get(
++                "https://www.wikidata.org/w/api.php",
++                params={
++                    "action": "wbsearchentities",
++                    "format": "json",
++                    "language": "it",
++                    "type": "item",
++                    "search": city,
++                    "limit": 3,
++                },
++                headers=hdr,
++                timeout=10,
++            )
++            items = r.json().get("search", [])
++            if not items:
++                return None
++            ids = "|".join(item["id"] for item in items)
++            # 2. get claims (P94 = coat of arms image)
++            r = requests.get(
++                "https://www.wikidata.org/w/api.php",
++                params={
++                    "action": "wbgetentities",
++                    "format": "json",
++                    "ids": ids,
++                    "props": "claims",
++                },
++                headers=hdr,
++                timeout=10,
++            )
++            entities = r.json().get("entities", {})
++            coa_file = None
++            for item in items:
++                claims = entities.get(item["id"], {}).get("claims", {})
++                for claim in claims.get("P94", []):
++                    value = (
++                        claim.get("mainsnak", {})
++                        .get("datavalue", {})
++                        .get("value")
++                    )
++                    if value:
++                        coa_file = value
++                        break
++                if coa_file:
++                    break
++            if not coa_file:
++                return None
++            # 3. get the thumbnail PNG URL from Wikimedia Commons
++            r = requests.get(
++                "https://commons.wikimedia.org/w/api.php",
++                params={
++                    "action": "query",
++                    "format": "json",
++                    "titles": "File:" + coa_file,
++                    "prop": "imageinfo",
++                    "iiprop": "url",
++                    "iiurlwidth": "64",
++                },
++                headers=hdr,
++                timeout=10,
++            )
++            pages = r.json().get("query", {}).get("pages", {})
++            thumb_url = None
++            for page in pages.values():
++                infos = page.get("imageinfo", [])
++                if infos and infos[0].get("thumburl"):
++                    thumb_url = infos[0]["thumburl"]
++                    break
++            if not thumb_url:
++                return None
++            # 4. download and cache the image
++            ext = os.path.splitext(thumb_url.split("?")[0])[1] or ".png"
++            coa_dir = os.path.join(tempfile.gettempdir(), "coatofarms")
++            os.makedirs(coa_dir, exist_ok=True)
++            safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", city).strip("_")[:50] or "city"
++            path = os.path.join(coa_dir, "%s%s" % (safe, ext))
++            r = requests.get(thumb_url, headers=hdr, timeout=15)
++            if r.status_code == 200:
++                with open(path, "wb") as fh:
++                    fh.write(r.content)
++                return path
++            return None
++        except Exception:
++            return None
++
+     def get_date(self, date):
+         """return a formatted date"""
+         return html.escape(self._get_date(date))
+@@ -1014,6 +1288,23 @@
+         )
+         add_option("imageOnTheSide", self.__image_on_side)
+ 
++        self.__include_coatsofarms = BooleanOption(
++            _("Include coats of arms of places"), False
++        )
++        self.__include_coatsofarms.set_help(
++            _(
++                "Whether to fetch and display the coat of arms of each "
++                "place of birth, residence, death and marriage from Wikimedia."
++            )
++        )
++        add_option("includeCoatsOfArms", self.__include_coatsofarms)
++
++        self.__coa_width = NumberOption(_("Coat of arms width"), 30, 10, 120)
++        self.__coa_width.set_help(
++            _("Width in points of the coat of arms images")
++        )
++        add_option("coaWidth", self.__coa_width)
++
+         # occupation = BooleanOption(_("Include occupation"), False)
+         occupation = EnumeratedListOption(_("Include occupation"), 0)
+         occupation.add_item(0, _("Do not include any occupation"))

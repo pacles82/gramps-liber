@@ -1,0 +1,59 @@
+services:
+  grampsweb: &grampsweb
+    image: ghcr.io/gramps-project/grampsweb:latest
+    restart: always
+    ports:
+      - "5055:5000"  # host:docker
+    environment:
+      GRAMPSWEB_TREE: "*"  # multi-tree: expose all trees in the Gramps database dir
+      GRAMPSWEB_MEDIA_PREFIX_TREE: "true"  # store media in a subfolder per tree
+      GRAMPSWEB_VECTOR_EMBEDDING_MODEL: "sentence-transformers/distiluse-base-multilingual-cased-v2"
+      GRAMPSWEB_LLM_MODEL: "qwen3.5-4b-instruct"
+      GRAMPSWEB_LLM_BASE_URL: "http://host.docker.internal:1234/v1"
+      OPENAI_API_KEY: "lm-studio"  # LM Studio ignores the key, any non-empty value works
+      GRAMPSWEB_LLM_MAX_CONTEXT_LENGTH: "12000"  # trim history early to fit the 16k context of the local model
+      GRAMPSWEB_CELERY_CONFIG__broker_url: "redis://grampsweb_redis:6379/0"
+      GRAMPSWEB_CELERY_CONFIG__result_backend: "redis://grampsweb_redis:6379/0"
+      GRAMPSWEB_RATELIMIT_STORAGE_URI: redis://grampsweb_redis:6379/1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - grampsweb_redis
+    volumes:
+      - gramps_users:/app/users  # persist user database
+      - gramps_index:/app/indexdir  # persist search index
+      - gramps_thumb_cache:/app/thumbnail_cache  # persist thumbnails
+      - gramps_cache:/app/cache  # persist export and report caches
+      - gramps_secret:/app/secret  # persist flask secret
+      - gramps_db:/root/.gramps/grampsdb  # persist Gramps database
+      - "/home/utente/Pictures/test5_072026 (1).gpkg.media:/app/media"  # persist media files
+      - gramps_tmp:/tmp
+      - "/home/utente/grampsweb/coatofarms:/venv/share/coatofarms"  # patch: local coat of arms overrides
+      - "/home/utente/grampsweb/frontend-config.js:/app/static/config.js"  # frontend config (hide register link in multi-tree)
+      - "/home/utente/grampsweb/agent.py:/venv/lib/python3.13/site-packages/gramps_webapi/api/llm/agent.py"  # patch: disable parallel tool calls (single tool call per turn)
+      - "/home/utente/grampsweb/index.html:/app/static/index.html"  # patch: cache-buster v=2 per il bundle modificato
+      - "/home/utente/grampsweb/BYLW92JT.js:/app/static/BYLW92JT.js"  # patch: add 'Antenati' menu item in sidebar
+      - "/home/utente/grampsweb/gvrelgraph.py:/venv/lib/python3.13/site-packages/gramps/plugins/graph/gvrelgraph.py"  # patch: coat of arms of birth/death places in rel_graph report
+
+  grampsweb_celery:
+    <<: *grampsweb  # YAML merge key copying the entire grampsweb service config
+    ports: []
+    container_name: grampsweb_celery
+    depends_on:
+      - grampsweb
+      - grampsweb_redis
+    command: celery -A gramps_webapi.celery worker --loglevel=INFO --concurrency=2
+
+  grampsweb_redis:
+    image: docker.io/valkey/valkey:8-alpine
+    container_name: grampsweb_redis
+    restart: always
+
+volumes:
+  gramps_users:
+  gramps_index:
+  gramps_thumb_cache:
+  gramps_cache:
+  gramps_secret:
+  gramps_db:
+  gramps_tmp:
